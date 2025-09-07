@@ -1,0 +1,161 @@
+name: Patch APK (apk-patchx)
+
+on:
+  workflow_dispatch:
+    inputs:
+      arch:
+        description: 'Target arch: arm, arm64, x86, x86_64'
+        required: true
+        default: 'arm64'
+        type: choice
+        options: [arm, arm64, x86, x86_64]
+      frida_version:
+        description: 'Optional Frida version (e.g., 16.2.1). Leave empty for latest.'
+        required: false
+        type: string
+      add_net:
+        description: 'Add permissive networkSecurityConfig'
+        required: true
+        default: 'false'
+        type: choice
+        options: ['true','false']
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    env:
+      APK_URL: https://github.com/kaifcodec/Upload_apk/releases/download/v1.0.4/base_ins_lite.apk
+      APK_NAME: base_ins_lite.apk
+      OUT_BASE: base_ins_lite.gadget
+      SIGNED_APK: base_ins_lite.gadget.signed.apk
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install apk-patchx
+        run: |
+          python -m pip install --upgrade pip
+          pip install apk-patchx
+
+      - name: Set up Java (required for apktool/apksigner)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Download APK
+        run: |
+          set -eux
+          curl -L "$APK_URL" -o "$APK_NAME"
+          ls -lah "$APK_NAME"
+        # Simple curl download pattern for public files. Adjust if you need auth. [web:38][web:62]
+
+      - name: Show versions
+        run: |
+          apk-patchx --version || true
+          java -version || true
+          python --version || true
+        # Sanity check to print tool versions. [web:38]
+
+      - name: Patch with apk-patchx
+        run: |
+          set -eux
+          ARCH="${{ inputs.arch }}"
+          FRIDA_VERSION="${{ inputs.frida_version }}"
+          NET_FLAG=""
+          [ "${{ inputs.add_net }}" = "true" ] && NET_FLAG="--net"
+
+          if [ -n "${FRIDA_VERSION}" ]; then
+            apk-patchx patch "${APK_NAME}" --arch "${ARCH}" ${NET_FLAG} --frida-version "${FRIDA_VERSION}"
+          else
+            apk-patchx patch "${APK_NAME}" --arch "${ARCH}" ${NET_FLAG}
+          fi
+
+          # Try to detect patched output produced by the tool
+          OUT=""
+          for c in \
+            "$(basename "${APK_NAME%.apk}").gadget_signed.apk" \
+            "$(basename "${APK_NAME%.apk}").gadget.signed.apk" \
+            "$(basename "${APK_NAME%.apk}").gadget.apk" \
+            "$(basename "${APK_NAME%.apk}").gadget.aligned.apk" \
+            "$(basename "${APK_NAME%.apk}").gadget-unsigned.apk"
+          do
+            if [ -f "$c" ]; then OUT="$c"; break; fi
+          done
+
+          # Fallback to newest APK if naming differs
+          if [ -z "$OUT" ]; then
+            OUT="$(ls -1t *.apk | head -n1)"
+          fi
+
+          echo "Patched output detected: $OUT"
+          test -n "$OUT" && test -f "$OUT"
+          cp -f "$OUT" "${OUT_BASE}.apk"
+        # The curl download and artifact naming approach is common in Actions workflows. [web:38][web:62]
+
+      - name: Generate throwaway keystore (runtime)
+        run: |
+          set -eux
+          openssl rand -hex 8 > rand.txt
+          RAND="$(cat rand.txt)"
+          KEYSTORE="throwaway-${RAND}.keystore"
+          ALIAS="alias_${RAND}"
+          STOREPASS="$(openssl rand -hex 16)"
+          KEYPASS="$(openssl rand -hex 16)"
+          echo "KEYSTORE=${KEYSTORE}" >> $GITHUB_ENV
+          echo "ALIAS=${ALIAS}" >> $GITHUB_ENV
+          echo "STOREPASS=${STOREPASS}" >> $GITHUB_ENV
+          echo "KEYPASS=${KEYPASS}" >> $GITHUB_ENV
+
+          keytool -genkey -v \
+            -keystore "${KEYSTORE}" \
+            -alias "${ALIAS}" \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000 \
+            -storepass "${STOREPASS}" \
+            -keypass "${KEYPASS}" \
+            -dname "CN=Throwaway, OU=CI, O=CI, L=CI, S=CI, C=US" \
+            -noprompt
+        # keytool and runtime keystore generation are standard in CI; no secrets required. [web:30]
+
+      - name: Align and sign with throwaway keystore
+        run: |
+          set -eux
+          # Locate zipalign/apksigner; apk-patchx bootstraps SDK tools, but ensure paths here.
+          if command -v zipalign >/dev/null 2>&1; then
+            ZIPALIGN="$(command -v zipalign)"
+          else
+            ZIPALIGN="${HOME}/.apkpatcher/tools/sdk/build-tools/33.0.1/zipalign"
+          fi
+          if command -v apksigner >/dev/null 2>&1; then
+            APKSIGNER="$(command -v apksigner)"
+          else
+            APKSIGNER="${HOME}/.apkpatcher/tools/sdk/build-tools/33.0.1/apksigner"
+          fi
+          test -x "${ZIPALIGN}" || { echo "zipalign not found"; exit 1; }
+          test -x "${APKSIGNER}" || { echo "apksigner not found"; exit 1; }
+
+          "${ZIPALIGN}" -p 4 "${OUT_BASE}.apk" "${OUT_BASE}.aligned.apk"
+
+          "${APKSIGNER}" sign \
+            --ks "${KEYSTORE}" \
+            --ks-key-alias "${ALIAS}" \
+            --ks-pass "pass:${STOREPASS}" \
+            --key-pass "pass:${KEYPASS}" \
+            --out "${SIGNED_APK}" \
+            "${OUT_BASE}.aligned.apk"
+        # Align and sign are the canonical finalization steps for APKs in CI pipelines. [web:27][web:32]
+
+      - name: Upload patched APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-patched
+          path: ${{ env.SIGNED_APK }}
+        # Uploading artifacts with v4 is the current recommended action/version. [web:28][web:31]
