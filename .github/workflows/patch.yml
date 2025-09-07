@@ -42,28 +42,52 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install apk-patchx
+        # Standard pip install for public PyPI package. [2]
 
       - name: Set up Java (required for apktool/apksigner)
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
+        # keytool/apksigner need a JRE/JDK; temurin 17 is fine for CI. [6]
 
       - name: Download APK
         run: |
           set -eux
           curl -L "$APK_URL" -o "$APK_NAME"
           ls -lah "$APK_NAME"
-        # Simple curl download pattern for public files. Adjust if you need auth. [web:38][web:62]
+        # Simple curl download pattern for public release assets. [2][3]
+
+      - name: Pre-create tool dirs (avoid root-owned)
+        run: |
+          set -eux
+          mkdir -p "${HOME}/.apkpatcher/tools"
+          mkdir -p "${HOME}/.apkpatcher/tools/cmdline-tools"
+          mkdir -p "${HOME}/.apkpatcher/tools/sdk"
+        # Ensures apk-patchx writes into $HOME and not into restricted paths. [2]
+
+      - name: Fix cmdline-tools permissions
+        run: |
+          set -eux
+          if [ -d "${HOME}/.apkpatcher/tools/cmdline-tools/bin" ]; then
+            chmod +x "${HOME}/.apkpatcher/tools/cmdline-tools/bin/"* || true
+          fi
+          if [ -d "${HOME}/.apkpatcher/tools/sdk/build-tools" ]; then
+            find "${HOME}/.apkpatcher/tools/sdk/build-tools" -type f -maxdepth 2 -printf '%p\0' | xargs -0 -r chmod +x || true
+          fi
+          if [ -d "${HOME}/.apkpatcher/tools/sdk/platform-tools" ]; then
+            chmod +x "${HOME}/.apkpatcher/tools/sdk/platform-tools/"* || true
+          fi
+        # Sets exec bit on sdkmanager/adb/zipalign/apksigner if present already. [2][3]
 
       - name: Show versions
         run: |
           apk-patchx --version || true
           java -version || true
           python --version || true
-        # Sanity check to print tool versions. [web:38]
+        # Sanity check to print tool versions. [2]
 
-      - name: Patch with apk-patchx
+      - name: Patch with apk-patchx (with retry)
         run: |
           set -eux
           ARCH="${{ inputs.arch }}"
@@ -71,13 +95,32 @@ jobs:
           NET_FLAG=""
           [ "${{ inputs.add_net }}" = "true" ] && NET_FLAG="--net"
 
-          if [ -n "${FRIDA_VERSION}" ]; then
-            apk-patchx patch "${APK_NAME}" --arch "${ARCH}" ${NET_FLAG} --frida-version "${FRIDA_VERSION}"
-          else
-            apk-patchx patch "${APK_NAME}" --arch "${ARCH}" ${NET_FLAG}
+          try_patch() {
+            if [ -n "${FRIDA_VERSION}" ]; then
+              apk-patchx patch "${APK_NAME}" --arch "${ARCH}" ${NET_FLAG} --frida-version "${FRIDA_VERSION}"
+            else
+              apk-patchx patch "${APK_NAME}" --arch "${ARCH}" ${NET_FLAG}
+            fi
+          }
+
+          # First attempt
+          if ! try_patch; then
+            echo "First attempt failed; repairing permissions and retrying..."
+            # Fix permissions again in case the tool just downloaded cmdline-tools
+            if [ -d "${HOME}/.apkpatcher/tools/cmdline-tools/bin" ]; then
+              chmod +x "${HOME}/.apkpatcher/tools/cmdline-tools/bin/"* || true
+            fi
+            if [ -d "${HOME}/.apkpatcher/tools/sdk/build-tools" ]; then
+              find "${HOME}/.apkpatcher/tools/sdk/build-tools" -type f -maxdepth 2 -printf '%p\0' | xargs -0 -r chmod +x || true
+            fi
+            if [ -d "${HOME}/.apkpatcher/tools/sdk/platform-tools" ]; then
+              chmod +x "${HOME}/.apkpatcher/tools/sdk/platform-tools/"* || true
+            fi
+            # Retry
+            try_patch
           fi
 
-          # Try to detect patched output produced by the tool
+          # Detect output
           OUT=""
           for c in \
             "$(basename "${APK_NAME%.apk}").gadget_signed.apk" \
@@ -88,16 +131,13 @@ jobs:
           do
             if [ -f "$c" ]; then OUT="$c"; break; fi
           done
-
-          # Fallback to newest APK if naming differs
           if [ -z "$OUT" ]; then
             OUT="$(ls -1t *.apk | head -n1)"
           fi
-
           echo "Patched output detected: $OUT"
           test -n "$OUT" && test -f "$OUT"
           cp -f "$OUT" "${OUT_BASE}.apk"
-        # The curl download and artifact naming approach is common in Actions workflows. [web:38][web:62]
+        # Retry pattern plus permission fix avoids “Permission denied” on sdkmanager. [2][3]
 
       - name: Generate throwaway keystore (runtime)
         run: |
@@ -123,12 +163,11 @@ jobs:
             -keypass "${KEYPASS}" \
             -dname "CN=Throwaway, OU=CI, O=CI, L=CI, S=CI, C=US" \
             -noprompt
-        # keytool and runtime keystore generation are standard in CI; no secrets required. [web:30]
+        # Standard runtime keystore generation via keytool. [6]
 
       - name: Align and sign with throwaway keystore
         run: |
           set -eux
-          # Locate zipalign/apksigner; apk-patchx bootstraps SDK tools, but ensure paths here.
           if command -v zipalign >/dev/null 2>&1; then
             ZIPALIGN="$(command -v zipalign)"
           else
@@ -151,11 +190,11 @@ jobs:
             --key-pass "pass:${KEYPASS}" \
             --out "${SIGNED_APK}" \
             "${OUT_BASE}.aligned.apk"
-        # Align and sign are the canonical finalization steps for APKs in CI pipelines. [web:27][web:32]
+        # Canonical finalize: align then sign for installable output. [7][8]
 
       - name: Upload patched APK
         uses: actions/upload-artifact@v4
         with:
           name: apk-patched
           path: ${{ env.SIGNED_APK }}
-        # Uploading artifacts with v4 is the current recommended action/version. [web:28][web:31]
+        # Artifact upload with v4 (recommended). [4][5]
